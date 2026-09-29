@@ -33,7 +33,9 @@ static lv_obj_t * spinner = NULL;
 static lv_obj_t * list_updates = NULL;
 
 // Declaração do ícone compilado junto ao binário
-LV_IMAGE_DECLARE(icon_updater); 
+LV_IMAGE_DECLARE(icon_updater);
+
+static void check_updates_task(void *pvParameters);
 
 // ==========================================
 // ESTILOS GLOBAIS E UI BASE
@@ -67,7 +69,7 @@ static void build_updater_ui() {
 
     spinner = lv_spinner_create(scr_updater);
     lv_obj_set_size(spinner, 80, 80);
-    lv_obj_align(spinner, LV_ALIGN_CENTER, 0, -40);
+    lv_obj_align(spinner, LV_ALIGN_CENTER, 0, -60);
     lv_obj_set_style_arc_color(spinner, lv_color_hex(0x333333), LV_PART_MAIN);
     lv_obj_set_style_arc_color(spinner, lv_color_hex(0x007BFF), LV_PART_INDICATOR);
     lv_obj_set_style_arc_width(spinner, 8, LV_PART_MAIN);
@@ -78,7 +80,7 @@ static void build_updater_ui() {
     lv_obj_set_style_text_color(lbl_status, lv_color_white(), 0);
     lv_obj_set_style_text_font(lbl_status, &lv_font_montserrat_20, 0);
     lv_obj_set_style_text_align(lbl_status, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_align(lbl_status, LV_ALIGN_CENTER, 0, 40);
+    lv_obj_align(lbl_status, LV_ALIGN_CENTER, 0, 20);
 }
 
 // ==========================================
@@ -131,17 +133,13 @@ static void download_and_install_task(void *pvParameters) {
     const char* new_version = cJSON_GetObjectItem(app_info, "version")->valuestring;
     
     if (bsp_display_lock(pdMS_TO_TICKS(100))) {
-        lv_obj_clean(scr_updater); 
-        build_updater_ui(); 
-        lv_obj_set_hidden(spinner, false);
-        lv_label_set_text_fmt(lbl_status, "Baixando %s...\nPor favor aguarde.", app_id);
+        lv_obj_set_hidden(list_updates, true); 
+        lv_obj_set_hidden(spinner, false);     
+        lv_obj_set_hidden(lbl_status, false);
+        lv_label_set_text_fmt(lbl_status, "Conectando...\n%s", app_id);
         bsp_display_unlock();
     }
 
-    ESP_LOGI(TAG, "Iniciando Download: %s", download_url);
-
-    // --- NOVA ABORDAGEM DE DOWNLOAD: USO DO EVENT HANDLER ---
-    
     char tmp_path[128];
     char final_path[128];
     
@@ -160,68 +158,50 @@ static void download_and_install_task(void *pvParameters) {
         return;
     }
 
-    // Variáveis de escopo local para monitorar o andamento
-    int total_bytes = 0;
     bool download_success = false;
 
-    // Criamos um callback engenhoso que o HTTP_CLIENT vai chamar toda vez que chegar um "pedaço" do arquivo
+    // Atualiza a tela indicando que o download real começou
+    if (bsp_display_lock(pdMS_TO_TICKS(10))) {
+        lv_label_set_text_fmt(lbl_status, "Baixando arquivo...\nIsso pode demorar.");
+        bsp_display_unlock();
+    }
+
     esp_http_client_config_t config = {};
     config.url = download_url;
     config.crt_bundle_attach = esp_crt_bundle_attach; 
     config.buffer_size_tx = 2048; 
-    config.buffer_size = 16384; // Chunk seguro para a PSRAM
-    config.user_data = f; // Passamos o arquivo SD direto para o Callback
+    config.buffer_size = 16384; 
+    config.user_data = f; 
+    
+    // Simplificamos o callback apenas para escrever os dados silenciosamente
     config.event_handler = [](esp_http_client_event_t *evt) -> esp_err_t {
-        switch (evt->event_id) {
-            case HTTP_EVENT_ON_HEADER:
-                // Tenta pescar o Content-Length do Header verdadeiro da AWS, ignorando o do GitHub
-                if (strcasecmp(evt->header_key, "Content-Length") == 0) {
-                    // Nós colocaremos o total_bytes numa variável estática atrelada a task
-                }
-                break;
-            case HTTP_EVENT_ON_DATA:
-                if (!esp_http_client_is_chunked_response(evt->client)) {
-                    FILE *fp = (FILE*)evt->user_data;
-                    fwrite(evt->data, 1, evt->data_len, fp);
-                    // O esp_http_client_perform gerencia as travas de hardware automaticamente
-                }
-                break;
-            default:
-                break;
+        if (evt->event_id == HTTP_EVENT_ON_DATA && !esp_http_client_is_chunked_response(evt->client)) {
+            FILE *fp = (FILE*)evt->user_data;
+            fwrite(evt->data, 1, evt->data_len, fp);
         }
         return ESP_OK;
     };
     
     esp_http_client_handle_t client = esp_http_client_init(&config);
     esp_http_client_set_redirection(client); 
-    
-    // Header vital! O GitHub recusa imediatamente sem ele.
     esp_http_client_set_header(client, "User-Agent", "ESP32-Smartwatch-Updater");
 
-    // A MÁGICA: esp_http_client_perform executa TODO o ciclo (Redirecionamentos, Headers e Payload) sozinho!
-    ESP_LOGI(TAG, "Iniciando a sessao perform (Lidando com Redirecionamentos AWS automaticamente)...");
+    // O comando bloqueante que faz a mágica acontecer
     esp_err_t err = esp_http_client_perform(client);
 
     if (err == ESP_OK) {
         int status_code = esp_http_client_get_status_code(client);
-        total_bytes = esp_http_client_get_content_length(client);
-        ESP_LOGI(TAG, "HTTPS Status = %d, Arquivo recebido: %d bytes", status_code, total_bytes);
-        
-        if (status_code == 200) {
-            download_success = true;
-        }
-    } else {
-        ESP_LOGE(TAG, "HTTP GET request falhou: %s", esp_err_to_name(err));
+        if (status_code == 200) download_success = true;
     }
 
     fclose(f);
     esp_http_client_cleanup(client);
 
-    // ==========================================
-    // ETAPA DE CONSOLIDAÇÃO DO ARQUIVO
-    // ==========================================
     if (download_success) {
-        ESP_LOGI(TAG, "Download Perfeito. Convertendo TMP em BIN...");
+        if (bsp_display_lock(pdMS_TO_TICKS(100))) {
+            lv_label_set_text(lbl_status, "Instalando...");
+            bsp_display_unlock();
+        }
         
         remove(final_path);
         rename(tmp_path, final_path);
@@ -245,7 +225,6 @@ static void download_and_install_task(void *pvParameters) {
             if (root) {
                 cJSON_ReplaceItemInObject(root, app_id, cJSON_CreateString(new_version));
                 char *new_jstr = cJSON_PrintUnformatted(root);
-                
                 vf = fopen("/sdcard/apps/versions.json", "w");
                 if (vf) {
                     fputs(new_jstr, vf);
@@ -258,12 +237,24 @@ static void download_and_install_task(void *pvParameters) {
 
         if (bsp_display_lock(pdMS_TO_TICKS(100))) {
             lv_obj_set_hidden(spinner, true);
-            lv_label_set_text(lbl_status, "Atualizacao Concluida!\nPressione Botao Lateral.");
+            lv_label_set_text(lbl_status, "Concluido! \n" LV_SYMBOL_OK);
             lv_obj_set_style_text_color(lbl_status, lv_color_hex(0x00FF00), 0);
             bsp_display_unlock();
         }
+        
+        vTaskDelay(pdMS_TO_TICKS(2500)); 
+
+        if (bsp_display_lock(pdMS_TO_TICKS(100))) {
+            lv_obj_set_style_text_color(lbl_status, lv_color_white(), 0);
+            bsp_display_unlock();
+        }
+        
+        cJSON_Delete(app_info); 
+        xTaskCreatePinnedToCore(check_updates_task, "update_task", 16384, NULL, 5, NULL, 1);
+        vTaskDelete(NULL);
+        return;
+        
     } else {
-        ESP_LOGE(TAG, "Download Corrompido ou Falhou. Abortando.");
         remove(tmp_path);
         if (bsp_display_lock(pdMS_TO_TICKS(100))) {
             lv_obj_set_hidden(spinner, true);
@@ -284,7 +275,14 @@ static void btn_update_click_cb(lv_event_t * e) {
 
 static void check_updates_task(void *pvParameters) {
     if (bsp_display_lock(pdMS_TO_TICKS(100))) {
-        lv_label_set_text(lbl_status, "Conectado!\nLendo Cartao SD...");
+        // Prepara a tela inicial de checagem
+        lv_obj_set_hidden(spinner, false);
+        lv_obj_set_hidden(lbl_status, false);
+        lv_label_set_text(lbl_status, "Lendo Cartao SD...");
+        if(list_updates != NULL) {
+            lv_obj_delete(list_updates);
+            list_updates = NULL;
+        }
         bsp_display_unlock();
     }
     vTaskDelay(pdMS_TO_TICKS(500));
@@ -313,25 +311,6 @@ static void check_updates_task(void *pvParameters) {
         return;
     }
 
-    if (bsp_display_lock(pdMS_TO_TICKS(100))) {
-        lv_obj_clean(scr_updater); 
-        
-        lv_obj_t * title = lv_label_create(scr_updater);
-        lv_label_set_text(title, "Atualizacoes Disponiveis");
-        lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
-        lv_obj_set_style_text_color(title, lv_color_white(), 0);
-        lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 30);
-
-        list_updates = lv_obj_create(scr_updater); // Substituto do lv_list
-        lv_obj_set_size(list_updates, 320, 370);
-        lv_obj_align(list_updates, LV_ALIGN_BOTTOM_MID, 0, -20);
-        lv_obj_set_style_bg_color(list_updates, lv_color_black(), 0);
-        lv_obj_set_style_border_width(list_updates, 0, 0);
-        lv_obj_set_flex_flow(list_updates, LV_FLEX_FLOW_COLUMN); // Organiza em lista
-        
-        bsp_display_unlock();
-    }
-
     int updates_found = 0;
     cJSON *app_node = local_versions->child;
     
@@ -340,20 +319,41 @@ static void check_updates_task(void *pvParameters) {
     config.buffer_size_tx = 1024;
     config.buffer_size = 8192; 
 
+    // Cria a lista invisível no fundo enquanto checa
+    if (bsp_display_lock(pdMS_TO_TICKS(100))) {
+        list_updates = lv_obj_create(scr_updater); 
+        lv_obj_set_size(list_updates, 320, 370);
+        lv_obj_align(list_updates, LV_ALIGN_BOTTOM_MID, 0, -20);
+        lv_obj_set_style_bg_color(list_updates, lv_color_black(), 0);
+        lv_obj_set_style_border_width(list_updates, 0, 0);
+        lv_obj_set_flex_flow(list_updates, LV_FLEX_FLOW_COLUMN);
+        lv_obj_set_hidden(list_updates, true); // Oculto durante a busca
+        
+        lv_obj_t * title = lv_label_create(list_updates);
+        lv_label_set_text(title, "Atualizacoes");
+        lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
+        lv_obj_set_style_text_color(title, lv_color_white(), 0);
+        bsp_display_unlock();
+    }
+
     while (app_node) {
         const char *app_id = app_node->string; 
         const char *current_ver = app_node->valuestring;
         
+        // FEEDBACK VISUAL: Mostra qual app está sendo checado!
+        if (bsp_display_lock(pdMS_TO_TICKS(100))) {
+            lv_label_set_text_fmt(lbl_status, "Buscando updates:\n%s", app_id);
+            bsp_display_unlock();
+        }
+        ESP_LOGW(TAG, "=> Consultando API GitHub para: %s", app_id);
+
         char github_api_url[256];
-        // SEUS REPOS DEVEM CHAMAR "app_doom", "app_gbc", etc. SE NÃO, ALTERE AQUI PARA %s
         snprintf(github_api_url, sizeof(github_api_url), "https://api.github.com/repos/Lucas-D-Souza/app_%s/releases/latest", app_id);
         
         config.url = github_api_url;
         esp_http_client_handle_t client = esp_http_client_init(&config);
         esp_http_client_set_header(client, "User-Agent", "ESP32-Updater");
         
-        ESP_LOGI(TAG, "Checando %s...", github_api_url);
-
         esp_err_t err = esp_http_client_open(client, 0);
         if (err == ESP_OK) {
             esp_http_client_fetch_headers(client);
@@ -377,7 +377,6 @@ static void check_updates_task(void *pvParameters) {
                         
                         if (strcmp(latest_ver, current_ver) != 0) {
                             updates_found++;
-                            
                             cJSON *first_asset = cJSON_GetArrayItem(assets, 0);
                             cJSON *dl_url = cJSON_GetObjectItem(first_asset, "browser_download_url");
                             
@@ -392,7 +391,7 @@ static void check_updates_task(void *pvParameters) {
                                     snprintf(btn_text, sizeof(btn_text), "%s  %s (v%s -> %s)", LV_SYMBOL_DOWNLOAD, app_id, current_ver, latest_ver);
                                     
                                     lv_obj_t * btn = lv_button_create(list_updates);
-                                    lv_obj_set_width(btn, lv_pct(100)); // Ocupa a largura toda
+                                    lv_obj_set_width(btn, lv_pct(100)); 
                                     lv_obj_set_style_bg_color(btn, lv_color_hex(0x222222), 0);
                                     lv_obj_set_style_border_width(btn, 0, 0);
                                     lv_obj_set_style_pad_all(btn, 15, 0);
@@ -401,7 +400,7 @@ static void check_updates_task(void *pvParameters) {
                                     lv_label_set_text(lbl, btn_text);
                                     lv_obj_set_style_text_color(lbl, lv_color_white(), 0);
                                     lv_obj_set_style_text_font(lbl, &lv_font_montserrat_16, 0);
-                                    lv_obj_center(lbl); // Centraliza texto e ícone no botão
+                                    lv_obj_center(lbl); 
                                     
                                     lv_obj_add_event_cb(btn, btn_update_click_cb, LV_EVENT_CLICKED, package);
                                     bsp_display_unlock();
@@ -416,21 +415,25 @@ static void check_updates_task(void *pvParameters) {
         }
         esp_http_client_cleanup(client);
         app_node = app_node->next; 
-        vTaskDelay(pdMS_TO_TICKS(200)); 
+        vTaskDelay(pdMS_TO_TICKS(100)); 
     }
 
     cJSON_Delete(local_versions);
 
-    if (updates_found == 0) {
-        if (bsp_display_lock(pdMS_TO_TICKS(100))) {
+    if (bsp_display_lock(pdMS_TO_TICKS(100))) {
+        lv_obj_set_hidden(spinner, true);
+        if (updates_found == 0) {
             lv_obj_t * lbl = lv_label_create(list_updates);
-            lv_label_set_text(lbl, "Voce esta 100% atualizado! " LV_SYMBOL_OK);
-            lv_obj_set_style_text_color(lbl, lv_color_hex(0x00FF00), 0);
+            lv_label_set_text(lbl, "Voce esta 100%\natualizado! " LV_SYMBOL_OK);
+            lv_obj_set_style_text_color(lbl, lv_color_white(), 0);
             lv_obj_set_style_text_font(lbl, &lv_font_montserrat_20, 0);
             lv_obj_set_style_text_align(lbl, LV_TEXT_ALIGN_CENTER, 0);
-            lv_obj_set_width(lbl, lv_pct(100)); // Centraliza no flex
-            bsp_display_unlock();
+            lv_obj_set_width(lbl, lv_pct(100)); 
+            lv_obj_set_style_pad_all(lbl, 40, 0); 
         }
+        lv_obj_set_hidden(lbl_status, true); // Oculta o texto "Buscando..."
+        lv_obj_set_hidden(list_updates, false); // Revela a lista finalizada
+        bsp_display_unlock();
     }
 
     vTaskDelete(NULL);
