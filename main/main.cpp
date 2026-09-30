@@ -13,30 +13,37 @@
 #include "esp_ota_ops.h"
 #include "esp_rom_sys.h"
 #include <string.h>
+#include <sys/stat.h>
 
 static const char *TAG = "Updater";
 #define BOOT_BTN_PIN GPIO_NUM_0
 
-// Telas e Variáveis Globais
 static lv_obj_t * scr_splash = NULL;
 static lv_obj_t * scr_wifi_list = NULL;
 static lv_obj_t * scr_password = NULL;
-static lv_obj_t * scr_updater = NULL;
+static lv_obj_t * scr_store = NULL;
 
 static lv_obj_t * list_wifi = NULL;
 static lv_obj_t * ta_wifi_pass = NULL;
 static lv_obj_t * label_wifi_title = NULL;
 static char current_ssid[33] = {0};
 
+static lv_obj_t * tv_store = NULL;
+static lv_obj_t * tab_loja = NULL;
+static lv_obj_t * tab_updates = NULL;
+static lv_obj_t * overlay_loading = NULL;
 static lv_obj_t * lbl_status = NULL;
 static lv_obj_t * spinner = NULL;
-static lv_obj_t * list_updates = NULL;
+
+static lv_obj_t * lbl_splash_version = NULL;
+
 static cJSON * pending_updates = NULL;
+static cJSON * job_queue = NULL;
+static cJSON * ui_packages = NULL;
 
-// Declaração do ícone compilado junto ao binário
-LV_IMAGE_DECLARE(icon_updater);
+LV_IMAGE_DECLARE(icon_updater); 
 
-static void check_updates_task(void *pvParameters);
+static void load_catalog_task(void *pvParameters);
 
 // ==========================================
 // ESTILOS GLOBAIS E UI BASE
@@ -63,44 +70,18 @@ static void style_dark_kb(lv_obj_t * kb) {
     lv_obj_set_style_pad_bottom(kb, 15, 0);
 }
 
-static void build_updater_ui() {
-    scr_updater = lv_obj_create(NULL);
-    lv_obj_set_style_bg_color(scr_updater, lv_color_black(), 0);
-    lv_obj_set_scroll_dir(scr_updater, LV_DIR_NONE);
-
-    spinner = lv_spinner_create(scr_updater);
-    lv_obj_set_size(spinner, 80, 80);
-    lv_obj_align(spinner, LV_ALIGN_CENTER, 0, -60);
-    lv_obj_set_style_arc_color(spinner, lv_color_hex(0x333333), LV_PART_MAIN);
-    lv_obj_set_style_arc_color(spinner, lv_color_hex(0x007BFF), LV_PART_INDICATOR);
-    lv_obj_set_style_arc_width(spinner, 8, LV_PART_MAIN);
-    lv_obj_set_style_arc_width(spinner, 8, LV_PART_INDICATOR);
-
-    lbl_status = lv_label_create(scr_updater);
-    lv_label_set_text(lbl_status, "Iniciando App Store...");
-    lv_obj_set_style_text_color(lbl_status, lv_color_white(), 0);
-    lv_obj_set_style_text_font(lbl_status, &lv_font_montserrat_20, 0);
-    lv_obj_set_style_text_align(lbl_status, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_align(lbl_status, LV_ALIGN_CENTER, 0, 20);
-}
-
 // ==========================================
-// FUNÇÕES DE HARDWARE
+// FUNÇÕES DE HARDWARE & FLASH SEGURO
 // ==========================================
 static void return_to_factory() {
-    ESP_LOGI(TAG, "Retornando ao Factory Firmware...");
     if (bsp_display_lock(pdMS_TO_TICKS(100))) {
         bsp_display_brightness_set(0); 
         bsp_display_unlock();
     }
     const esp_partition_t *factory_part = esp_partition_find_first(ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_APP_FACTORY, NULL);
-    if (factory_part) {
-        esp_ota_set_boot_partition(factory_part);
-        vTaskDelay(pdMS_TO_TICKS(500));
-        esp_restart();
-    } else {
-        esp_restart();
-    }
+    if (factory_part) esp_ota_set_boot_partition(factory_part);
+    vTaskDelay(pdMS_TO_TICKS(500));
+    esp_restart();
 }
 
 static void clear_i2c_bus(void) {
@@ -110,7 +91,6 @@ static void clear_i2c_bus(void) {
     io_conf.pin_bit_mask = (1ULL << GPIO_NUM_14) | (1ULL << GPIO_NUM_15);
     io_conf.pull_up_en = GPIO_PULLUP_ENABLE;
     gpio_config(&io_conf);
-
     gpio_set_level(GPIO_NUM_15, 1); esp_rom_delay_us(100);
     for (int i = 0; i < 9; i++) {
         gpio_set_level(GPIO_NUM_14, 0); esp_rom_delay_us(100);
@@ -119,193 +99,324 @@ static void clear_i2c_bus(void) {
     gpio_set_level(GPIO_NUM_15, 0); esp_rom_delay_us(100);
     gpio_set_level(GPIO_NUM_14, 1); esp_rom_delay_us(100);
     gpio_set_level(GPIO_NUM_15, 1); esp_rom_delay_us(100);
-
     gpio_reset_pin(GPIO_NUM_14);
     gpio_reset_pin(GPIO_NUM_15);
 }
 
-// ==========================================
-// CÓDIGOS DA APP STORE & GITHUB
-// ==========================================
-static void download_and_install_task(void *pvParameters) {
-    // Recupera o índice enviado pelo botão (-1 significa Atualizar TODOS)
-    int target_idx = (int)(intptr_t)pvParameters;
+static bool flash_factory_from_sd() {
+    FILE* f = fopen("/sdcard/factory.bin", "rb");
+    if (!f) return false;
     
+    fseek(f, 0, SEEK_END);
+    size_t file_size = ftell(f);
+    fseek(f, 0, SEEK_SET);
+
+    uint8_t magic;
+    fread(&magic, 1, 1, f);
+    if (magic != 0xE9) { 
+        ESP_LOGE(TAG, "Arquivo de Firmware Invalido! (Magic Byte != 0xE9)");
+        fclose(f); 
+        return false; 
+    }
+
+    const esp_partition_t *factory_part = esp_partition_find_first(ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_APP_FACTORY, NULL);
+    if (!factory_part || file_size > factory_part->size) {
+        ESP_LOGE(TAG, "Particao invalida ou firmware grande demais!");
+        fclose(f);
+        return false;
+    }
+
     if (bsp_display_lock(pdMS_TO_TICKS(100))) {
-        lv_obj_set_hidden(list_updates, true); 
-        lv_obj_set_hidden(spinner, false);     
-        lv_obj_set_hidden(lbl_status, false);
+        lv_label_set_text(lbl_status, "Gravando Memoria Flash...\nNao desligue o relogio!");
         bsp_display_unlock();
     }
 
-    int start_idx = (target_idx == -1) ? 0 : target_idx;
-    int end_idx   = (target_idx == -1) ? cJSON_GetArraySize(pending_updates) : target_idx + 1;
-    int total_to_update = end_idx - start_idx;
-    int current_update_num = 1;
-
-    bool all_success = true;
-
-    for (int i = start_idx; i < end_idx; i++) {
-        cJSON *app_info = cJSON_GetArrayItem(pending_updates, i);
-        const char* app_id = cJSON_GetObjectItem(app_info, "id")->valuestring;
-        const char* download_url = cJSON_GetObjectItem(app_info, "url")->valuestring;
-        const char* new_version = cJSON_GetObjectItem(app_info, "version")->valuestring;
-        
-        // INTERFACE CORRIGIDA: Texto elegante que não some
-        if (bsp_display_lock(pdMS_TO_TICKS(100))) {
-            if (total_to_update > 1) {
-                lv_label_set_text_fmt(lbl_status, "Atualizando %s...\n(%d de %d)", app_id, current_update_num, total_to_update);
-            } else {
-                lv_label_set_text_fmt(lbl_status, "Atualizando %s...", app_id);
-            }
-            bsp_display_unlock();
-        }
-
-        ESP_LOGI(TAG, "Baixando: %s", download_url);
-
-        char tmp_path[128], final_path[128];
-        if (strcmp(app_id, "factory") == 0) {
-            snprintf(tmp_path, sizeof(tmp_path), "/sdcard/factory.tmp");
-            snprintf(final_path, sizeof(final_path), "/sdcard/factory.bin");
-        } else {
-            snprintf(tmp_path, sizeof(tmp_path), "/sdcard/apps/%s/app.tmp", app_id);
-            snprintf(final_path, sizeof(final_path), "/sdcard/apps/%s/app.bin", app_id);
-        }
-
-        FILE *f = fopen(tmp_path, "wb");
-        if (!f) {
-            all_success = false;
-            break;
-        }
-
-        esp_http_client_config_t config = {};
-        config.url = download_url;
-        config.crt_bundle_attach = esp_crt_bundle_attach; 
-        config.buffer_size_tx = 2048; 
-        config.buffer_size = 16384; 
-        config.user_data = f; 
-        
-        config.event_handler = [](esp_http_client_event_t *evt) -> esp_err_t {
-            if (evt->event_id == HTTP_EVENT_ON_DATA && !esp_http_client_is_chunked_response(evt->client)) {
-                FILE *fp = (FILE*)evt->user_data;
-                fwrite(evt->data, 1, evt->data_len, fp);
-            }
-            return ESP_OK;
-        };
-        
-        esp_http_client_handle_t client = esp_http_client_init(&config);
-        esp_http_client_set_redirection(client); 
-        esp_http_client_set_header(client, "User-Agent", "ESP32-Smartwatch-Updater");
-
-        bool download_success = false;
-        esp_err_t err = esp_http_client_perform(client);
-
-        if (err == ESP_OK && esp_http_client_get_status_code(client) == 200) {
-            download_success = true;
-        }
-
-        fclose(f);
-        esp_http_client_cleanup(client);
-
-        // ==========================================
-        // CONSOLIDAÇÃO DO ARQUIVO ATUAL E JSON
-        // ==========================================
-        if (download_success) {
-            remove(final_path);
-            rename(tmp_path, final_path);
-
-            FILE *vf = fopen("/sdcard/apps/versions.json", "r");
-            if (vf) {
-                fseek(vf, 0, SEEK_END);
-                long fsize = ftell(vf);
-                fseek(vf, 0, SEEK_SET);
-                char *jstr = (char*)heap_caps_malloc(fsize + 1, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-                fread(jstr, 1, fsize, vf);
-                fclose(vf);
-                jstr[fsize] = 0;
-                
-                char *ptr = jstr;
-                if ((unsigned char)ptr[0] == 0xEF && (unsigned char)ptr[1] == 0xBB) ptr += 3;
-
-                cJSON *root = cJSON_Parse(ptr);
-                heap_caps_free(jstr);
-
-                if (root) {
-                    cJSON_ReplaceItemInObject(root, app_id, cJSON_CreateString(new_version));
-                    char *new_jstr = cJSON_PrintUnformatted(root);
-                    vf = fopen("/sdcard/apps/versions.json", "w");
-                    if (vf) {
-                        fputs(new_jstr, vf);
-                        fclose(vf);
-                    }
-                    free(new_jstr);
-                    cJSON_Delete(root);
-                }
-            }
-        } else {
-            remove(tmp_path);
-            all_success = false;
-            break; // Para o loop se um der erro
-        }
-        current_update_num++;
+    ESP_LOGI(TAG, "Apagando particao Factory...");
+    if (esp_partition_erase_range(factory_part, 0, factory_part->size) != ESP_OK) {
+        fclose(f); return false;
     }
 
-    // FINALIZAÇÃO DA TAREFA
+    ESP_LOGI(TAG, "Gravando arquivo na Flash...");
+    size_t written = 0;
+    uint8_t *buf = (uint8_t*)heap_caps_malloc(16384, MALLOC_CAP_INTERNAL);
+    fseek(f, 0, SEEK_SET);
+    
+    while(written < file_size) {
+        size_t to_read = (file_size - written > 16384) ? 16384 : (file_size - written);
+        fread(buf, 1, to_read, f);
+        if (esp_partition_write(factory_part, written, buf, to_read) != ESP_OK) {
+            heap_caps_free(buf); fclose(f); return false;
+        }
+        written += to_read;
+        if (written % (16384 * 4) == 0 && bsp_display_lock(pdMS_TO_TICKS(10))) {
+            lv_label_set_text_fmt(lbl_status, "Gravando Flash: %d %%", (written * 100) / file_size);
+            bsp_display_unlock();
+        }
+        vTaskDelay(pdMS_TO_TICKS(2));
+    }
+    heap_caps_free(buf);
+    fclose(f);
+    
+    esp_ota_set_boot_partition(factory_part);
+    return true;
+}
+
+// ==========================================
+// FUNÇÃO PARA LER A VERSÃO ATUAL DO SD
+// ==========================================
+static void get_app_version_from_sd(const char* app_id, char* out_version, size_t max_len) {
+    strncpy(out_version, "0.0.0", max_len); // Versão padrão caso dê erro ou não encontre
+    FILE *vf = fopen("/sdcard/apps/versions.json", "r");
+    if (vf) {
+        fseek(vf, 0, SEEK_END);
+        long fsize = ftell(vf);
+        fseek(vf, 0, SEEK_SET);
+        if(fsize > 0) {
+            char *jstr = (char*)heap_caps_malloc(fsize + 1, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+            fread(jstr, 1, fsize, vf);
+            jstr[fsize] = 0;
+            char *ptr = jstr;
+            if ((unsigned char)ptr[0] == 0xEF && (unsigned char)ptr[1] == 0xBB) ptr += 3;
+            
+            cJSON *root = cJSON_Parse(ptr);
+            if (root) {
+                cJSON *ver_item = cJSON_GetObjectItem(root, app_id);
+                if (ver_item && ver_item->valuestring) {
+                    strncpy(out_version, ver_item->valuestring, max_len - 1);
+                    out_version[max_len - 1] = '\0';
+                }
+                cJSON_Delete(root);
+            }
+            heap_caps_free(jstr);
+        }
+        fclose(vf);
+    }
+}
+
+// ==========================================
+// CÓDIGOS DA APP STORE & GITHUB ZERO-API
+// ==========================================
+static void update_local_version(const char* id, const char* version) {
+    FILE *vf = fopen("/sdcard/apps/versions.json", "r");
+    cJSON *root = NULL;
+    if (vf) {
+        fseek(vf, 0, SEEK_END);
+        long fsize = ftell(vf);
+        fseek(vf, 0, SEEK_SET);
+        if (fsize > 0) {
+            char *jstr = (char*)heap_caps_malloc(fsize + 1, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+            fread(jstr, 1, fsize, vf);
+            char *ptr = jstr;
+            if ((unsigned char)ptr[0] == 0xEF && (unsigned char)ptr[1] == 0xBB) ptr += 3;
+            root = cJSON_Parse(ptr);
+            heap_caps_free(jstr);
+        }
+        fclose(vf);
+    }
+    if (!root) root = cJSON_CreateObject();
+
+    if (version == NULL) cJSON_DeleteItemFromObject(root, id);
+    else {
+        if (cJSON_HasObjectItem(root, id)) cJSON_ReplaceItemInObject(root, id, cJSON_CreateString(version));
+        else cJSON_AddStringToObject(root, id, version);
+    }
+
+    char *new_jstr = cJSON_PrintUnformatted(root);
+    vf = fopen("/sdcard/apps/versions.json", "w");
+    if (vf) { fputs(new_jstr, vf); fclose(vf); }
+    free(new_jstr);
+    cJSON_Delete(root);
+}
+
+// O Wget Otimizado para baixar pacotes com redirecionamentos transparentes
+static bool download_file(const char* url, const char* filepath, const char* msg) {
+    ESP_LOGI(TAG, "=> Download Request: %s", url);
+    
     if (bsp_display_lock(pdMS_TO_TICKS(100))) {
-        lv_obj_set_hidden(spinner, true);
+        lv_label_set_text(lbl_status, msg);
+        bsp_display_unlock();
+    }
+    FILE *f = fopen(filepath, "wb");
+    if (!f) return false;
+
+    esp_http_client_config_t config = {};
+    config.url = url;
+    config.crt_bundle_attach = esp_crt_bundle_attach; 
+    config.buffer_size_tx = 2048; 
+    config.buffer_size = 16384; 
+    config.user_data = f; 
+    
+    config.event_handler = [](esp_http_client_event_t *evt) -> esp_err_t {
+        if (evt->event_id == HTTP_EVENT_ON_DATA && !esp_http_client_is_chunked_response(evt->client)) {
+            FILE *fp = (FILE*)evt->user_data;
+            fwrite(evt->data, 1, evt->data_len, fp);
+        }
+        return ESP_OK;
+    };
+    
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    esp_http_client_set_redirection(client); 
+    esp_http_client_set_header(client, "User-Agent", "ESP32-Smartwatch-Updater");
+
+    esp_err_t err = esp_http_client_perform(client);
+    int status = esp_http_client_get_status_code(client);
+    fclose(f);
+    esp_http_client_cleanup(client);
+
+    // Se falhou OU se a página retornou "404 Not Found", deleta o arquivo inútil gerado!
+    if (err != ESP_OK || status != 200) {
+        remove(filepath); 
+        ESP_LOGE(TAG, "Falha Download (HTTP %d): %s", status, url);
+        return false;
+    }
+    return true;
+}
+
+static void process_jobs_task(void *pvParameters) {
+    if (bsp_display_lock(pdMS_TO_TICKS(100))) {
+        lv_obj_set_hidden(overlay_loading, false); 
+        bsp_display_unlock();
+    }
+
+    int total_jobs = cJSON_GetArraySize(job_queue);
+    bool all_success = true;
+
+    for (int i = 0; i < total_jobs; i++) {
+        cJSON *job = cJSON_GetArrayItem(job_queue, i);
+        const char *id = cJSON_GetObjectItem(job, "id")->valuestring;
+        const char *version = cJSON_GetObjectItem(job, "version")->valuestring;
+        const char *type = cJSON_GetObjectItem(job, "type")->valuestring;
+        int action = cJSON_GetObjectItem(job, "action")->valueint; 
+
+        if (action == 0) {
+            // DESINSTALAÇÃO
+            if (bsp_display_lock(pdMS_TO_TICKS(100))) {
+                lv_label_set_text_fmt(lbl_status, "Removendo %s...", id);
+                bsp_display_unlock();
+            }
+            char path[128];
+            snprintf(path, sizeof(path), "/sdcard/apps/%s/app.bin", id); remove(path);
+            snprintf(path, sizeof(path), "/sdcard/apps/%s/app.json", id); remove(path);
+            snprintf(path, sizeof(path), "/sdcard/apps/%s/icon.png", id); remove(path);
+            snprintf(path, sizeof(path), "/sdcard/apps/%s", id); rmdir(path);
+            update_local_version(id, NULL);
+
+        } else if (action == 1) {
+            // INSTALAÇÃO OU UPDATE (Com remoção forçada da cópia antiga)
+            char url_bin[256], url_json[256], url_png[256], tmp_bin[128];
+            bool ok = false;
+
+            if (strcmp(type, "sys") == 0) {
+                // FACTORY
+                // Regra do Nome de Arquivo Dinâmico da Nuvem
+                snprintf(url_bin, sizeof(url_bin), "https://github.com/Lucas-D-Souza/app_%s/releases/download/%s/factory.bin", id, version);
+                char msg[64]; snprintf(msg, sizeof(msg), "Baixando Firmware...\n(%d de %d)", i+1, total_jobs);
+                
+                if (download_file(url_bin, "/sdcard/factory.tmp", msg)) {
+                    remove("/sdcard/factory.bin");
+                    rename("/sdcard/factory.tmp", "/sdcard/factory.bin");
+                    ok = flash_factory_from_sd();
+                }
+            } else {
+                // APP PADRÃO
+                char dir_path[64];
+                snprintf(dir_path, sizeof(dir_path), "/sdcard/apps/%s", id);
+                mkdir(dir_path, 0777); 
+
+                // Prepara links estritos da AWS via GitHub Redirects
+                snprintf(url_bin, sizeof(url_bin), "https://github.com/Lucas-D-Souza/app_%s/releases/download/%s/app.bin", id, version);
+                snprintf(url_json, sizeof(url_json), "https://github.com/Lucas-D-Souza/app_%s/releases/download/%s/app.json", id, version);
+                snprintf(url_png, sizeof(url_png), "https://github.com/Lucas-D-Souza/app_%s/releases/download/%s/icon.png", id, version);
+
+                snprintf(tmp_bin, sizeof(tmp_bin), "%s/app.tmp", dir_path);
+                char path_json[128]; snprintf(path_json, sizeof(path_json), "%s/app.json", dir_path);
+                char path_png[128]; snprintf(path_png, sizeof(path_png), "%s/icon.png", dir_path);
+
+                char msg_bin[64]; snprintf(msg_bin, sizeof(msg_bin), "Baixando %s.bin\n(%d de %d)", id, i+1, total_jobs);
+                
+                // Se algum arquivo existir, vamos apagar para não dar conflito!
+                remove(tmp_bin); remove(path_json); remove(path_png);
+
+                ok = download_file(url_bin, tmp_bin, msg_bin);
+                if (ok) ok = download_file(url_json, path_json, "Baixando app.json...");
+                if (ok) ok = download_file(url_png, path_png, "Baixando icon.png...");
+
+                if (ok) {
+                    char final_bin[128]; snprintf(final_bin, sizeof(final_bin), "%s/app.bin", dir_path);
+                    remove(final_bin);
+                    rename(tmp_bin, final_bin);
+                }
+            }
+
+            if (ok) update_local_version(id, version);
+            else all_success = false;
+        }
+    }
+
+    if (bsp_display_lock(pdMS_TO_TICKS(100))) {
         if (all_success) {
-            lv_label_set_text(lbl_status, "Concluido! \n" LV_SYMBOL_OK);
+            lv_label_set_text(lbl_status, "Concluido! " LV_SYMBOL_OK);
             lv_obj_set_style_text_color(lbl_status, lv_color_hex(0x00FF00), 0);
         } else {
-            lv_label_set_text(lbl_status, "Falha no Download!\nVerifique o Wi-Fi.");
+            lv_label_set_text(lbl_status, "Falha na operacao!\n(Erro 404 ou Wi-Fi)");
             lv_obj_set_style_text_color(lbl_status, lv_color_hex(0xFF0000), 0);
         }
         bsp_display_unlock();
     }
     
-    vTaskDelay(pdMS_TO_TICKS(2500)); 
+    vTaskDelay(pdMS_TO_TICKS(2000)); 
+    xTaskCreatePinnedToCore(load_catalog_task, "catalog", 16384, NULL, 5, NULL, 1);
+    vTaskDelete(NULL);
+}
 
+static void btn_action_click_cb(lv_event_t * e) {
+    cJSON *pkg = (cJSON*)lv_event_get_user_data(e);
+    int action = cJSON_GetObjectItem(pkg, "action")->valueint;
+    
+    if (job_queue) cJSON_Delete(job_queue);
+    job_queue = cJSON_CreateArray();
+
+    if (action == 2) { 
+        for(int i=0; i < cJSON_GetArraySize(pending_updates); i++) {
+            cJSON_AddItemToArray(job_queue, cJSON_Duplicate(cJSON_GetArrayItem(pending_updates, i), 1));
+        }
+    } else {
+        cJSON_AddItemToArray(job_queue, cJSON_Duplicate(pkg, 1));
+    }
+    xTaskCreatePinnedToCore(process_jobs_task, "jobs", 24000, NULL, 5, NULL, 1);
+}
+
+static void load_catalog_task(void *pvParameters) {
     if (bsp_display_lock(pdMS_TO_TICKS(100))) {
+        lv_obj_set_hidden(overlay_loading, false);
+        lv_label_set_text(lbl_status, "Lendo Catalogo da Nuvem...");
         lv_obj_set_style_text_color(lbl_status, lv_color_white(), 0);
         bsp_display_unlock();
     }
     
-    // Limpa a Fila Global e Relança o Update Scanner!
-    if (pending_updates) {
-        cJSON_Delete(pending_updates);
-        pending_updates = NULL;
-    }
-    xTaskCreatePinnedToCore(check_updates_task, "update_task", 16384, NULL, 5, NULL, 1);
-    vTaskDelete(NULL);
-}
-
-static void btn_update_click_cb(lv_event_t * e) {
-    // Recebe o ID do app dentro da fila global (ou -1) e despacha a task
-    int idx = (int)(intptr_t)lv_event_get_user_data(e);
-    xTaskCreatePinnedToCore(download_and_install_task, "dl_task", 16384, (void*)(intptr_t)idx, 5, NULL, 1);
-}
-
-static void check_updates_task(void *pvParameters) {
-    if (bsp_display_lock(pdMS_TO_TICKS(100))) {
-        lv_obj_set_hidden(spinner, false);
-        lv_obj_set_hidden(lbl_status, false);
-        lv_label_set_text(lbl_status, "Lendo Cartao SD...");
-        if(list_updates != NULL) {
-            lv_obj_delete(list_updates);
-            list_updates = NULL;
+    const char * raw_url = "https://raw.githubusercontent.com/Lucas-D-Souza/app_store_catalog/main/catalog.json";
+    if (!download_file(raw_url, "/sdcard/catalog.tmp", "Baixando Catalogo...")) {
+        if (bsp_display_lock(pdMS_TO_TICKS(100))) {
+            lv_label_set_text(lbl_status, "Falha de Conexao!");
+            bsp_display_unlock();
         }
-        bsp_display_unlock();
+        vTaskDelete(NULL);
+        return;
     }
-    vTaskDelay(pdMS_TO_TICKS(500));
 
-    // Reinicia a Fila Global a cada nova varredura
-    if (pending_updates) {
-        cJSON_Delete(pending_updates);
-    }
-    pending_updates = cJSON_CreateArray();
+    FILE *cf = fopen("/sdcard/catalog.tmp", "r");
+    fseek(cf, 0, SEEK_END);
+    long csize = ftell(cf);
+    fseek(cf, 0, SEEK_SET);
+    char *cstr = (char*)heap_caps_malloc(csize + 1, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    fread(cstr, 1, csize, cf);
+    fclose(cf);
+    cstr[csize] = 0;
+    cJSON *catalog = cJSON_Parse(cstr);
+    heap_caps_free(cstr);
 
-    cJSON *local_versions = NULL;
     FILE *vf = fopen("/sdcard/apps/versions.json", "r");
+    cJSON *local_versions = NULL;
     if (vf) {
         fseek(vf, 0, SEEK_END);
         long fsize = ftell(vf);
@@ -314,192 +425,237 @@ static void check_updates_task(void *pvParameters) {
         fread(jstr, 1, fsize, vf);
         fclose(vf);
         jstr[fsize] = 0;
-        
         char *ptr = jstr;
         if ((unsigned char)ptr[0] == 0xEF && (unsigned char)ptr[1] == 0xBB) ptr += 3;
         local_versions = cJSON_Parse(ptr);
         heap_caps_free(jstr);
     }
+    if (!local_versions) local_versions = cJSON_CreateObject();
 
-    if (!local_versions) {
-        ESP_LOGE(TAG, "Falha ao ler versions.json local!");
-        vTaskDelete(NULL);
-        return;
-    }
-
-    int updates_found = 0;
-    bool rate_limit_hit = false; // <--- NOVA FLAG ANTI-BLOQUEIO DO GITHUB
-    cJSON *app_node = local_versions->child;
+    if (pending_updates) cJSON_Delete(pending_updates);
+    pending_updates = cJSON_CreateArray();
     
-    esp_http_client_config_t config = {};
-    config.crt_bundle_attach = esp_crt_bundle_attach; 
-    config.buffer_size_tx = 1024;
-    config.buffer_size = 16384; 
+    if (ui_packages) cJSON_Delete(ui_packages);
+    ui_packages = cJSON_CreateArray();
 
     if (bsp_display_lock(pdMS_TO_TICKS(100))) {
-        list_updates = lv_obj_create(scr_updater); 
-        lv_obj_set_size(list_updates, 320, 370);
-        lv_obj_align(list_updates, LV_ALIGN_BOTTOM_MID, 0, -20);
-        lv_obj_set_style_bg_color(list_updates, lv_color_black(), 0);
-        lv_obj_set_style_border_width(list_updates, 0, 0);
-        lv_obj_set_flex_flow(list_updates, LV_FLEX_FLOW_COLUMN);
-        lv_obj_set_hidden(list_updates, true); 
-        
-        lv_obj_t * title = lv_label_create(list_updates);
-        lv_label_set_text(title, "Atualizacoes");
-        lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
-        lv_obj_set_style_text_color(title, lv_color_white(), 0);
+        lv_obj_clean(tab_loja);
+        lv_obj_clean(tab_updates);
+        lv_obj_set_flex_flow(tab_loja, LV_FLEX_FLOW_COLUMN);
+        lv_obj_set_flex_flow(tab_updates, LV_FLEX_FLOW_COLUMN);
         bsp_display_unlock();
     }
 
-    while (app_node) {
-        const char *app_id = app_node->string; 
-        const char *current_ver = app_node->valuestring;
-        
-        if (bsp_display_lock(pdMS_TO_TICKS(100))) {
-            lv_label_set_text_fmt(lbl_status, "Buscando updates:\n%s", app_id);
+    int updates_count = 0;
+
+    for (int i = 0; i < cJSON_GetArraySize(catalog); i++) {
+        cJSON *cat_app = cJSON_GetArrayItem(catalog, i);
+        const char *id = cJSON_GetObjectItem(cat_app, "id")->valuestring;
+        const char *name = cJSON_GetObjectItem(cat_app, "name")->valuestring;
+        const char *cat_version = cJSON_GetObjectItem(cat_app, "version")->valuestring;
+        cJSON *type_item = cJSON_GetObjectItem(cat_app, "type");
+        const char *type = (type_item && type_item->valuestring) ? type_item->valuestring : "app";
+
+        cJSON *local_app = cJSON_GetObjectItem(local_versions, id);
+        bool is_installed = (local_app != NULL);
+
+        // --- LOG DE DEBUG PARA O MONITOR SERIAL ---
+        if (is_installed) {
+            ESP_LOGW(TAG, "App: %s | Local: v%s | Nuvem: v%s", id, local_app->valuestring, cat_version);
+        } else {
+            ESP_LOGW(TAG, "App: %s | Local: N/A | Nuvem: v%s", id, cat_version);
+        }
+
+        // VARIÁVEIS DE DESENHO DA TELA
+        bool show_in_store = true; // Apps sempre aparecem na loja agora!
+        bool show_in_update = false;
+        const char * store_btn_sym = "";
+        uint32_t store_btn_color = 0;
+        int store_action = 0;
+
+        if (is_installed) {
+            const char *local_version = local_app->valuestring;
+            
+            // SE TIVER UPDATE, MOSTRA NA ABA UPDATE E DEIXA A LIXEIRA NA LOJA
+            if (strcmp(local_version, cat_version) != 0) {
+                show_in_update = true;
+                
+                cJSON *p = cJSON_CreateObject();
+                cJSON_AddStringToObject(p, "id", id);
+                cJSON_AddStringToObject(p, "version", cat_version);
+                cJSON_AddStringToObject(p, "type", type);
+                cJSON_AddNumberToObject(p, "action", 1);
+                cJSON_AddItemToArray(pending_updates, p);
+                
+                if (bsp_display_lock(pdMS_TO_TICKS(100))) {
+                    lv_obj_t * row = lv_obj_create(tab_updates);
+                    lv_obj_set_width(row, lv_pct(100));
+                    lv_obj_set_height(row, LV_SIZE_CONTENT);
+                    lv_obj_set_style_bg_color(row, lv_color_hex(0x222222), 0);
+                    lv_obj_set_style_border_width(row, 0, 0);
+                    
+                    lv_obj_t * lbl_name = lv_label_create(row);
+                    lv_label_set_text_fmt(lbl_name, "%s\nv%s -> %s", name, local_version, cat_version);
+                    lv_obj_set_style_text_color(lbl_name, lv_color_white(), 0);
+                    lv_obj_align(lbl_name, LV_ALIGN_LEFT_MID, 0, 0);
+                    
+                    lv_obj_t * btn = lv_button_create(row);
+                    lv_obj_set_size(btn, 60, 45);
+                    lv_obj_align(btn, LV_ALIGN_RIGHT_MID, 0, 0);
+                    lv_obj_set_style_bg_color(btn, lv_color_hex(0x007BFF), 0); // Azul
+                    
+                    lv_obj_t * lbl_btn = lv_label_create(btn);
+                    lv_label_set_text(lbl_btn, LV_SYMBOL_DOWNLOAD);
+                    lv_obj_center(lbl_btn);
+
+                    cJSON *pkg = cJSON_Duplicate(p, 1);
+                    cJSON_AddItemToArray(ui_packages, pkg);
+                    lv_obj_add_event_cb(btn, btn_action_click_cb, LV_EVENT_CLICKED, pkg);
+                    bsp_display_unlock();
+                }
+                updates_count++;
+            } 
+            
+            // CONFIGURA A LINHA DA LOJA (Lixeira) - Se não for "sys" nem o próprio "updater"
+            if (strcmp(type, "sys") != 0 && strcmp(id, "updater") != 0) {
+                store_action = 0; // Excluir
+                store_btn_sym = LV_SYMBOL_TRASH;
+                store_btn_color = 0xDC3545; // Vermelho
+            } else {
+                show_in_store = false; // Factory e Updater ocultam os botões de Lixeira
+                // Mostramos apenas o texto sem botão:
+                if (bsp_display_lock(pdMS_TO_TICKS(100))) {
+                    lv_obj_t * row = lv_obj_create(tab_loja);
+                    lv_obj_set_width(row, lv_pct(100));
+                    lv_obj_set_height(row, LV_SIZE_CONTENT);
+                    lv_obj_set_style_bg_color(row, lv_color_hex(0x222222), 0);
+                    lv_obj_set_style_border_width(row, 0, 0);
+                    
+                    lv_obj_t * lbl_name = lv_label_create(row);
+                    lv_label_set_text_fmt(lbl_name, "%s\nInstalado (v%s)", name, local_version);
+                    lv_obj_set_style_text_color(lbl_name, lv_color_hex(0x888888), 0); // Cinza para travar
+                    lv_obj_align(lbl_name, LV_ALIGN_LEFT_MID, 0, 0);
+                    bsp_display_unlock();
+                }
+            }
+
+        } else {
+            // NUNCA INSTALADO (Loja: Nuvem)
+            store_action = 1; // Instalar
+            store_btn_sym = LV_SYMBOL_UPLOAD;
+            store_btn_color = 0x28A745; // Verde
+        }
+
+        // DESENHA A LINHA DA LOJA (Caso precise do Botão de Ação)
+        if (show_in_store && bsp_display_lock(pdMS_TO_TICKS(100))) {
+            lv_obj_t * row = lv_obj_create(tab_loja);
+            lv_obj_set_width(row, lv_pct(100));
+            lv_obj_set_height(row, LV_SIZE_CONTENT);
+            lv_obj_set_style_bg_color(row, lv_color_hex(0x222222), 0);
+            lv_obj_set_style_border_width(row, 0, 0);
+            
+            lv_obj_t * lbl_name = lv_label_create(row);
+            const char * ver_loja = is_installed ? local_app->valuestring : cat_version;
+            lv_label_set_text_fmt(lbl_name, "%s\nv%s", name, ver_loja);
+            lv_obj_set_style_text_color(lbl_name, lv_color_white(), 0);
+            lv_obj_align(lbl_name, LV_ALIGN_LEFT_MID, 0, 0);
+            
+            lv_obj_t * btn = lv_button_create(row);
+            lv_obj_set_size(btn, 60, 45);
+            lv_obj_align(btn, LV_ALIGN_RIGHT_MID, 0, 0);
+            lv_obj_set_style_bg_color(btn, lv_color_hex(store_btn_color), 0);
+            
+            lv_obj_t * lbl_btn = lv_label_create(btn);
+            lv_label_set_text(lbl_btn, store_btn_sym);
+            lv_obj_set_style_text_font(lbl_btn, &lv_font_montserrat_20, 0);
+            lv_obj_center(lbl_btn);
+
+            cJSON *pkg = cJSON_CreateObject();
+            cJSON_AddStringToObject(pkg, "id", id);
+            cJSON_AddStringToObject(pkg, "version", cat_version);
+            cJSON_AddStringToObject(pkg, "type", type);
+            cJSON_AddNumberToObject(pkg, "action", store_action);
+            cJSON_AddItemToArray(ui_packages, pkg);
+
+            lv_obj_add_event_cb(btn, btn_action_click_cb, LV_EVENT_CLICKED, pkg);
             bsp_display_unlock();
         }
-        ESP_LOGW(TAG, "=> Consultando API GitHub para: %s", app_id);
-
-        char github_api_url[256];
-        snprintf(github_api_url, sizeof(github_api_url), "https://api.github.com/repos/Lucas-D-Souza/app_%s/releases/latest", app_id);
-        
-        config.url = github_api_url;
-        esp_http_client_handle_t client = esp_http_client_init(&config);
-        esp_http_client_set_header(client, "User-Agent", "ESP32-Updater");
-        
-        esp_err_t err = esp_http_client_open(client, 0);
-        if (err == ESP_OK) {
-            esp_http_client_fetch_headers(client);
-            int status_code = esp_http_client_get_status_code(client);
-            
-            // VERIFICA SE O GITHUB CORTOU A NOSSA CONEXÃO POR EXCESSO DE ACESSOS (403)
-            if (status_code == 403) {
-                ESP_LOGE(TAG, "Limite da API do GitHub atingido (403 Forbidden)!");
-                rate_limit_hit = true;
-                esp_http_client_cleanup(client);
-                break; // Abandona o laço para não perder mais tempo
-            }
-            
-            // Se o Status for 200 (OK), processa os dados do JSON do site
-            if (status_code == 200) {
-                char *resp_buf = (char*)heap_caps_calloc(1, 24576, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT); // Buffer de 24KB para textos gigantes
-                int total_read = 0;
-                while(1) {
-                    int read = esp_http_client_read(client, resp_buf + total_read, 24576 - total_read - 1);
-                    if (read <= 0) break;
-                    total_read += read;
-                }
-                
-                if (total_read > 0) {
-                    cJSON *git_json = cJSON_Parse(resp_buf);
-                    if (git_json) {
-                        cJSON *tag_item = cJSON_GetObjectItem(git_json, "tag_name");
-                        cJSON *assets = cJSON_GetObjectItem(git_json, "assets");
-                        
-                        if (tag_item && tag_item->valuestring && assets && cJSON_GetArraySize(assets) > 0) {
-                            const char *latest_ver = tag_item->valuestring;
-                            if (strcmp(latest_ver, current_ver) != 0) {
-                                
-                                cJSON *first_asset = cJSON_GetArrayItem(assets, 0);
-                                cJSON *dl_url = cJSON_GetObjectItem(first_asset, "browser_download_url");
-                                
-                                if (dl_url && dl_url->valuestring) {
-                                    cJSON *package = cJSON_CreateObject();
-                                    cJSON_AddStringToObject(package, "id", app_id);
-                                    cJSON_AddStringToObject(package, "version", latest_ver);
-                                    cJSON_AddStringToObject(package, "url", dl_url->valuestring);
-                                    cJSON_AddItemToArray(pending_updates, package);
-                                    
-                                    if (bsp_display_lock(pdMS_TO_TICKS(100))) {
-                                        char btn_text[64];
-                                        snprintf(btn_text, sizeof(btn_text), "%s  %s (v%s -> %s)", LV_SYMBOL_DOWNLOAD, app_id, current_ver, latest_ver);
-                                        
-                                        lv_obj_t * btn = lv_button_create(list_updates);
-                                        lv_obj_set_width(btn, lv_pct(100)); 
-                                        lv_obj_set_style_bg_color(btn, lv_color_hex(0x222222), 0);
-                                        lv_obj_set_style_border_width(btn, 0, 0);
-                                        lv_obj_set_style_pad_all(btn, 15, 0);
-                                        
-                                        lv_obj_t * lbl = lv_label_create(btn);
-                                        lv_label_set_text(lbl, btn_text);
-                                        lv_obj_set_style_text_color(lbl, lv_color_white(), 0);
-                                        lv_obj_set_style_text_font(lbl, &lv_font_montserrat_16, 0);
-                                        lv_obj_center(lbl); 
-                                        
-                                        lv_obj_add_event_cb(btn, btn_update_click_cb, LV_EVENT_CLICKED, (void*)(intptr_t)updates_found);
-                                        bsp_display_unlock();
-                                    }
-                                    updates_found++;
-                                }
-                            }
-                        }
-                        cJSON_Delete(git_json);
-                    }
-                }
-                heap_caps_free(resp_buf);
-            }
-        }
-        esp_http_client_cleanup(client);
-        app_node = app_node->next; 
-        vTaskDelay(pdMS_TO_TICKS(100)); 
     }
-    cJSON_Delete(local_versions);
 
-    // ==========================================
-    // EXIBE A LISTA (OU O ALERTA) NO FINAL
-    // ==========================================
     if (bsp_display_lock(pdMS_TO_TICKS(100))) {
-        if (rate_limit_hit) {
-            // Cria um alerta Laranja se o GitHub bloqueou o IP
-            lv_obj_t * lbl = lv_label_create(list_updates);
-            lv_label_set_text(lbl, LV_SYMBOL_WARNING " Limite do GitHub atingido!\nTente novamente em 1 hora.");
-            lv_obj_set_style_text_color(lbl, lv_color_hex(0xFFA500), 0); // Laranja 
-            lv_obj_set_style_text_font(lbl, &lv_font_montserrat_16, 0);
-            lv_obj_set_style_text_align(lbl, LV_TEXT_ALIGN_CENTER, 0);
-            lv_obj_set_width(lbl, lv_pct(100)); 
-            lv_obj_set_style_pad_all(lbl, 20, 0); 
-        } 
-        else if (updates_found > 1) {
-            lv_obj_t * btn_all = lv_button_create(list_updates);
+        if (updates_count > 1) {
+            lv_obj_t * btn_all = lv_button_create(tab_updates);
             lv_obj_set_width(btn_all, lv_pct(100)); 
             lv_obj_set_style_bg_color(btn_all, lv_color_hex(0x0055A4), 0); 
-            lv_obj_set_style_border_width(btn_all, 0, 0);
-            lv_obj_set_style_pad_all(btn_all, 15, 0);
-            
             lv_obj_t * lbl_all = lv_label_create(btn_all);
-            lv_label_set_text_fmt(lbl_all, "%s  Atualizar Todos (%d)", LV_SYMBOL_DOWNLOAD, updates_found);
-            lv_obj_set_style_text_color(lbl_all, lv_color_white(), 0);
-            lv_obj_set_style_text_font(lbl_all, &lv_font_montserrat_16, 0);
+            lv_label_set_text_fmt(lbl_all, "%s Atualizar Todos", LV_SYMBOL_DOWNLOAD);
             lv_obj_center(lbl_all); 
             
-            lv_obj_add_event_cb(btn_all, btn_update_click_cb, LV_EVENT_CLICKED, (void*)(intptr_t)-1);
-            lv_obj_move_to_index(btn_all, 1);
-        } 
-        else if (updates_found == 0) {
-            lv_obj_t * lbl = lv_label_create(list_updates);
-            lv_label_set_text(lbl, "Voce esta 100%\natualizado! " LV_SYMBOL_OK);
-            lv_obj_set_style_text_color(lbl, lv_color_white(), 0);
-            lv_obj_set_style_text_font(lbl, &lv_font_montserrat_20, 0);
+            cJSON *pkg_all = cJSON_CreateObject();
+            cJSON_AddNumberToObject(pkg_all, "action", 2); 
+            cJSON_AddItemToArray(ui_packages, pkg_all);
+
+            lv_obj_add_event_cb(btn_all, btn_action_click_cb, LV_EVENT_CLICKED, pkg_all);
+            lv_obj_move_to_index(btn_all, 0); 
+        } else if (updates_count == 0) {
+            lv_obj_t * lbl = lv_label_create(tab_updates);
+            lv_label_set_text(lbl, "Tudo atualizado!");
             lv_obj_set_style_text_align(lbl, LV_TEXT_ALIGN_CENTER, 0);
             lv_obj_set_width(lbl, lv_pct(100)); 
-            lv_obj_set_style_pad_all(lbl, 40, 0); 
         }
 
-        lv_obj_set_hidden(spinner, true);
-        lv_obj_set_hidden(lbl_status, true); 
-        lv_obj_set_hidden(list_updates, false); 
+        lv_obj_set_hidden(overlay_loading, true);
         bsp_display_unlock();
     }
 
+    cJSON_Delete(catalog);
+    cJSON_Delete(local_versions);
     vTaskDelete(NULL);
 }
 
+// ==========================================
+// TELA BASE E UI DO APP STORE
+// ==========================================
+static void build_store_ui() {
+    scr_store = lv_obj_create(NULL);
+    lv_obj_set_style_bg_color(scr_store, lv_color_black(), 0);
+    lv_obj_set_scroll_dir(scr_store, LV_DIR_NONE);
 
-// ==========================================
-// SPLASH SCREEN
-// ==========================================
+    tv_store = lv_tabview_create(scr_store);
+    lv_tabview_set_tab_bar_position(tv_store, LV_DIR_TOP);
+    lv_tabview_set_tab_bar_size(tv_store, 50);
+    lv_obj_set_style_bg_color(tv_store, lv_color_black(), 0);
+
+    lv_obj_t * tab_bar = lv_tabview_get_tab_bar(tv_store);
+    lv_obj_set_style_bg_color(tab_bar, lv_color_hex(0x111111), 0);
+    lv_obj_set_style_text_color(tab_bar, lv_color_hex(0x888888), 0);
+    lv_obj_set_style_text_color(tab_bar, lv_color_white(), (lv_style_selector_t)LV_PART_ITEMS | (lv_style_selector_t)LV_STATE_CHECKED);
+
+    tab_loja = lv_tabview_add_tab(tv_store, "Loja");
+    tab_updates = lv_tabview_add_tab(tv_store, "Updates");
+
+    lv_obj_set_style_pad_all(tab_loja, 5, 0);
+    lv_obj_set_style_pad_all(tab_updates, 5, 0);
+
+    overlay_loading = lv_obj_create(scr_store);
+    lv_obj_set_size(overlay_loading, 340, 340);
+    lv_obj_center(overlay_loading);
+    lv_obj_set_style_bg_color(overlay_loading, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(overlay_loading, LV_OPA_90, 0);
+    lv_obj_set_style_border_width(overlay_loading, 0, 0);
+    lv_obj_set_scroll_dir(overlay_loading, LV_DIR_NONE);
+    lv_obj_set_hidden(overlay_loading, true); 
+
+    spinner = lv_spinner_create(overlay_loading);
+    lv_obj_set_size(spinner, 60, 60);
+    lv_obj_align(spinner, LV_ALIGN_CENTER, 0, -40);
+
+    lbl_status = lv_label_create(overlay_loading);
+    lv_label_set_text(lbl_status, "Aguarde...");
+    lv_obj_set_style_text_align(lbl_status, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(lbl_status, LV_ALIGN_CENTER, 0, 20);
+}
+
 static void show_splash_screen(const char* version) {
     scr_splash = lv_obj_create(NULL);
     lv_obj_set_style_bg_color(scr_splash, lv_color_black(), 0);
@@ -513,7 +669,6 @@ static void show_splash_screen(const char* version) {
     
     lv_obj_set_flex_flow(cont_center, LV_FLEX_FLOW_ROW); 
     lv_obj_set_flex_align(cont_center, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_set_style_pad_all(cont_center, 0, 0);
     lv_obj_set_style_pad_column(cont_center, 25, 0); 
 
     lv_obj_t * logo = lv_image_create(cont_center);
@@ -522,27 +677,25 @@ static void show_splash_screen(const char* version) {
     lv_obj_set_size(logo, 100, 100);
 
     lv_obj_t * title = lv_label_create(cont_center);
-    lv_label_set_text(title, "Loja e\nAtualizacoes"); 
+    lv_label_set_text(title, "App\nStore"); 
     lv_obj_set_style_text_font(title, &lv_font_montserrat_30, 0); 
     lv_obj_set_style_text_color(title, lv_color_white(), 0);
 
-    lv_obj_t * lbl_version = lv_label_create(scr_splash);
-    lv_label_set_text_fmt(lbl_version, "v%s", version);
-    lv_obj_set_style_text_font(lbl_version, &lv_font_montserrat_16, 0);
-    lv_obj_set_style_text_color(lbl_version, lv_color_hex(0x555555), 0); 
-    lv_obj_align(lbl_version, LV_ALIGN_BOTTOM_MID, 0, -25);
+    lbl_splash_version = lv_label_create(scr_splash);
+    lv_label_set_text_fmt(lbl_splash_version, "v%s", version);
+    lv_obj_set_style_text_color(lbl_splash_version, lv_color_hex(0x555555), 0); 
+    lv_obj_align(lbl_splash_version, LV_ALIGN_BOTTOM_MID, 0, -25);
 
     lv_screen_load(scr_splash);
 }
+
 
 // ==========================================
 // INTERFACE: WI-FI LISTA & SENHA 
 // ==========================================
 static void start_wifi_scan(void) {
     wifi_ap_record_t ap_info;
-    if (esp_wifi_sta_get_ap_info(&ap_info) != ESP_OK) {
-        esp_wifi_disconnect(); 
-    }
+    if (esp_wifi_sta_get_ap_info(&ap_info) != ESP_OK) esp_wifi_disconnect(); 
     wifi_scan_config_t scan_config = {};
     scan_config.show_hidden = false;
     scan_config.scan_type = WIFI_SCAN_TYPE_ACTIVE;
@@ -559,7 +712,6 @@ static void wifi_list_item_click_cb(lv_event_t * e) {
         if (len > 32) len = 32;
         strncpy(current_ssid, text, len);
         current_ssid[len] = '\0';
-
         char title_buf[64];
         snprintf(title_buf, sizeof(title_buf), "Senha: %s", current_ssid);
         lv_label_set_text(label_wifi_title, title_buf);
@@ -587,7 +739,6 @@ static void build_wifi_ui() {
 
     lv_obj_t * txt = lv_label_create(list_wifi);
     lv_label_set_text(txt, "Buscando...");
-    lv_obj_set_style_text_color(txt, lv_color_white(), 0);
 
     scr_password = lv_obj_create(NULL);
     lv_obj_set_style_bg_color(scr_password, lv_color_black(), 0);
@@ -631,11 +782,11 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t e
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
         wifi_config_t saved_config = {};
         esp_wifi_get_config(WIFI_IF_STA, &saved_config);
-        
         if (strlen((char*)saved_config.sta.ssid) > 0) {
             if (bsp_display_lock(portMAX_DELAY)) {
                 lv_label_set_text_fmt(lbl_status, "Conectando a:\n%s", saved_config.sta.ssid);
-                lv_scr_load_anim(scr_updater, LV_SCR_LOAD_ANIM_FADE_ON, 400, 2000, true);
+                lv_scr_load_anim(scr_store, LV_SCR_LOAD_ANIM_FADE_ON, 400, 2000, true);
+                lv_obj_set_hidden(overlay_loading, false); 
                 bsp_display_unlock();
             }
             esp_wifi_connect();
@@ -679,7 +830,6 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t e
                     lv_obj_set_style_bg_color(btn, lv_color_hex(0x222222), 0);
                     lv_obj_t * lbl = lv_label_create(btn);
                     lv_label_set_text(lbl, list_item_text);
-                    lv_obj_set_style_text_color(lbl, lv_color_white(), 0);
                     lv_obj_center(lbl);
                     lv_obj_add_event_cb(btn, wifi_list_item_click_cb, LV_EVENT_CLICKED, NULL);
                 }
@@ -689,17 +839,11 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t e
         if(ap_info) free(ap_info);
     }
     else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
-        ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
-        ESP_LOGI(TAG, "IP Local: " IPSTR, IP2STR(&event->ip_info.ip));
-        
         if (bsp_display_lock(portMAX_DELAY)) {
-            if (lv_screen_active() != scr_updater) {
-                lv_scr_load_anim(scr_updater, LV_SCR_LOAD_ANIM_FADE_ON, 400, 0, false);
-            }
+            if (lv_screen_active() != scr_store) lv_scr_load_anim(scr_store, LV_SCR_LOAD_ANIM_FADE_ON, 400, 0, false);
             bsp_display_unlock();
         }
-        
-        xTaskCreatePinnedToCore(check_updates_task, "update_task", 16384, NULL, 5, NULL, 1);
+        xTaskCreatePinnedToCore(load_catalog_task, "catalog", 16384, NULL, 5, NULL, 1);
     }
 }
 
@@ -726,7 +870,7 @@ extern "C" void app_main(void) {
     bsp_display_start();
     
     if (bsp_display_lock(pdMS_TO_TICKS(100))) {
-        show_splash_screen("1.0.0");
+        show_splash_screen("...");
         bsp_display_unlock();
     }
 
@@ -735,9 +879,20 @@ extern "C" void app_main(void) {
 
     SdUsbManager::get_instance().init_local_storage();
 
+    // Lê a versão do JSON e atualiza a tela na mesma hora
+    char current_ver[16];
+    get_app_version_from_sd("updater", current_ver, sizeof(current_ver));
+    
+    if (bsp_display_lock(pdMS_TO_TICKS(100))) {
+        if(lbl_splash_version) {
+            lv_label_set_text_fmt(lbl_splash_version, "v%s", current_ver);
+        }
+        bsp_display_unlock();
+    }
+
     if (bsp_display_lock(pdMS_TO_TICKS(100))) {
         build_wifi_ui();
-        build_updater_ui();
+        build_store_ui();
         bsp_display_unlock();
     }
 
