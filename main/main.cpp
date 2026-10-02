@@ -14,6 +14,7 @@
 #include "esp_rom_sys.h"
 #include <string.h>
 #include <sys/stat.h>
+#include <dirent.h>
 
 static const char *TAG = "Updater";
 #define BOOT_BTN_PIN GPIO_NUM_0
@@ -302,20 +303,24 @@ static void process_jobs_task(void *pvParameters) {
             update_local_version(id, NULL);
 
         } else if (action == 1) {
-            // INSTALAÇÃO OU UPDATE (Com remoção forçada da cópia antiga)
-            char url_bin[256], url_json[256], url_png[256], tmp_bin[128];
+            // INSTALAÇÃO OU UPDATE (Com Proteção Atômica Contra Falhas)
+            char url_bin[256], url_json[256], url_png[256];
             bool ok = false;
 
             if (strcmp(type, "sys") == 0) {
                 // FACTORY
-                // Regra do Nome de Arquivo Dinâmico da Nuvem
                 snprintf(url_bin, sizeof(url_bin), "https://github.com/Lucas-D-Souza/app_%s/releases/download/%s/factory.bin", id, version);
                 char msg[64]; snprintf(msg, sizeof(msg), "Baixando Firmware...\n(%d de %d)", i+1, total_jobs);
                 
+                // Limpa lixo antigo temporário se existir
+                remove("/sdcard/factory.tmp");
+
                 if (download_file(url_bin, "/sdcard/factory.tmp", msg)) {
-                    remove("/sdcard/factory.bin");
+                    remove("/sdcard/factory.bin"); // Só apaga o oficial DEPOIS do .tmp dar sucesso
                     rename("/sdcard/factory.tmp", "/sdcard/factory.bin");
                     ok = flash_factory_from_sd();
+                } else {
+                    remove("/sdcard/factory.tmp"); // Apaga o arquivo corrompido, mantendo o velho
                 }
             } else {
                 // APP PADRÃO
@@ -323,28 +328,43 @@ static void process_jobs_task(void *pvParameters) {
                 snprintf(dir_path, sizeof(dir_path), "/sdcard/apps/%s", id);
                 mkdir(dir_path, 0777); 
 
-                // Prepara links estritos da AWS via GitHub Redirects
+                // Prepara links da nuvem
                 snprintf(url_bin, sizeof(url_bin), "https://github.com/Lucas-D-Souza/app_%s/releases/download/%s/app.bin", id, version);
                 snprintf(url_json, sizeof(url_json), "https://github.com/Lucas-D-Souza/app_%s/releases/download/%s/app.json", id, version);
                 snprintf(url_png, sizeof(url_png), "https://github.com/Lucas-D-Souza/app_%s/releases/download/%s/icon.png", id, version);
 
-                snprintf(tmp_bin, sizeof(tmp_bin), "%s/app.tmp", dir_path);
-                char path_json[128]; snprintf(path_json, sizeof(path_json), "%s/app.json", dir_path);
-                char path_png[128]; snprintf(path_png, sizeof(path_png), "%s/icon.png", dir_path);
+                // NOMES TEMPORÁRIOS (Proteção)
+                char tmp_bin[128];  snprintf(tmp_bin,  sizeof(tmp_bin),  "%s/app.bin.tmp", dir_path);
+                char tmp_json[128]; snprintf(tmp_json, sizeof(tmp_json), "%s/app.json.tmp", dir_path);
+                char tmp_png[128];  snprintf(tmp_png,  sizeof(tmp_png),  "%s/icon.png.tmp", dir_path);
 
-                char msg_bin[64]; snprintf(msg_bin, sizeof(msg_bin), "Baixando %s.bin\n(%d de %d)", id, i+1, total_jobs);
+                // NOMES FINAIS
+                char final_bin[128];  snprintf(final_bin,  sizeof(final_bin),  "%s/app.bin", dir_path);
+                char final_json[128]; snprintf(final_json, sizeof(final_json), "%s/app.json", dir_path);
+                char final_png[128];  snprintf(final_png,  sizeof(final_png),  "%s/icon.png", dir_path);
+
+                char msg_bin[64]; snprintf(msg_bin, sizeof(msg_bin), "Baixando %s\n(%d de %d)", id, i+1, total_jobs);
                 
-                // Se algum arquivo existir, vamos apagar para não dar conflito!
-                remove(tmp_bin); remove(path_json); remove(path_png);
+                // Limpa possíveis lixos de downloads interrompidos anteriormente
+                remove(tmp_bin); remove(tmp_json); remove(tmp_png);
 
+                // TENTA BAIXAR TUDO PARA OS ARQUIVOS .TMP (Sem tocar nos arquivos que já rodam no relógio)
                 ok = download_file(url_bin, tmp_bin, msg_bin);
-                if (ok) ok = download_file(url_json, path_json, "Baixando app.json...");
-                if (ok) ok = download_file(url_png, path_png, "Baixando icon.png...");
+                if (ok) ok = download_file(url_json, tmp_json, "Baixando metadados...");
+                if (ok) ok = download_file(url_png, tmp_png, "Baixando icone...");
 
                 if (ok) {
-                    char final_bin[128]; snprintf(final_bin, sizeof(final_bin), "%s/app.bin", dir_path);
-                    remove(final_bin);
-                    rename(tmp_bin, final_bin);
+                    // SUCESSO ABSOLUTO! Agora sim apagamos as versões velhas e oficializamos as novas
+                    remove(final_bin);  rename(tmp_bin, final_bin);
+                    remove(final_json); rename(tmp_json, final_json);
+                    remove(final_png);  rename(tmp_png, final_png);
+                    ESP_LOGI(TAG, "Instalacao do %s finalizada com seguranca.", id);
+                } else {
+                    // FALHA! Apaga apenas o lixo .tmp. O app antigo não sofreu nenhum arranhão!
+                    ESP_LOGE(TAG, "Download do %s falhou! Revertendo e mantendo versao anterior.", id);
+                    remove(tmp_bin);
+                    remove(tmp_json);
+                    remove(tmp_png);
                 }
             }
 
@@ -395,7 +415,7 @@ static void load_catalog_task(void *pvParameters) {
     }
     
     const char * raw_url = "https://raw.githubusercontent.com/Lucas-D-Souza/app_store_catalog/main/catalog.json";
-    if (!download_file(raw_url, "/sdcard/catalog.tmp", "Baixando Catalogo...")) {
+    if (!download_file(raw_url, "/sdcard/config/catalog.tmp", "Baixando Catalogo...")) {
         if (bsp_display_lock(pdMS_TO_TICKS(100))) {
             lv_label_set_text(lbl_status, "Falha de Conexao!");
             bsp_display_unlock();
@@ -404,7 +424,7 @@ static void load_catalog_task(void *pvParameters) {
         return;
     }
 
-    FILE *cf = fopen("/sdcard/catalog.tmp", "r");
+    FILE *cf = fopen("/sdcard/config/catalog.tmp", "r");
     fseek(cf, 0, SEEK_END);
     long csize = ftell(cf);
     fseek(cf, 0, SEEK_SET);
@@ -848,6 +868,62 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t e
 }
 
 // ==========================================
+// INTEGRIDADE DO SISTEMA DE ARQUIVOS
+// ==========================================
+static void ensure_fs_structure() {
+    // 1. Garante que as pastas vitais existem
+    mkdir("/sdcard/config", 0777);
+    mkdir("/sdcard/apps", 0777);
+
+    // 2. Verifica se o banco de dados de versão sumiu/não existe
+    FILE *f = fopen("/sdcard/apps/versions.json", "r");
+    if (f) {
+        fclose(f); // O arquivo existe, tudo perfeito!
+    } else {
+        ESP_LOGW(TAG, "versions.json ausente! Varrendo a pasta /apps para recriar...");
+        cJSON *root = cJSON_CreateObject();
+        
+        DIR *dir = opendir("/sdcard/apps");
+        if (dir) {
+            struct dirent *ent;
+            while ((ent = readdir(dir)) != NULL) {
+                // Ignora caminhos relativos e o próprio arquivo json (caso exista lixo)
+                if (strcmp(ent->d_name, ".") != 0 && strcmp(ent->d_name, "..") != 0 && strcmp(ent->d_name, "versions.json") != 0) {
+                    
+                    // Confirma se o que achamos é realmente uma pasta (e não um arquivo solto)
+                    char path[300];
+                    snprintf(path, sizeof(path), "/sdcard/apps/%s", ent->d_name);
+                    struct stat st;
+                    if (stat(path, &st) == 0 && S_ISDIR(st.st_mode)) {
+                        // Pasta encontrada! Adiciona ao JSON com a versão 0.0.0
+                        cJSON_AddStringToObject(root, ent->d_name, "0.0.0");
+                        ESP_LOGI(TAG, "App '%s' detectado e registrado como v0.0.0", ent->d_name);
+                    }
+                }
+            }
+            closedir(dir);
+        }
+
+        // Caso tenha o factory na raiz do SD, adiciona também
+        struct stat st_fact;
+        if (stat("/sdcard/factory.bin", &st_fact) == 0) {
+            cJSON_AddStringToObject(root, "factory", "0.0.0");
+            ESP_LOGI(TAG, "Factory.bin detectado na raiz.");
+        }
+        
+        // Salva o arquivo reconstruído
+        char *json_str = cJSON_PrintUnformatted(root);
+        FILE *vf = fopen("/sdcard/apps/versions.json", "w");
+        if (vf) {
+            fputs(json_str, vf);
+            fclose(vf);
+        }
+        free(json_str);
+        cJSON_Delete(root);
+    }
+}
+
+// ==========================================
 // INICIALIZAÇÃO PRINCIPAL
 // ==========================================
 extern "C" void app_main(void) {
@@ -878,6 +954,8 @@ extern "C" void app_main(void) {
     bsp_display_brightness_set(80);
 
     SdUsbManager::get_instance().init_local_storage();
+
+    ensure_fs_structure();
 
     // Lê a versão do JSON e atualiza a tela na mesma hora
     char current_ver[16];
