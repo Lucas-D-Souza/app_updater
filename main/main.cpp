@@ -244,7 +244,8 @@ static bool download_file(const char* url, const char* filepath, const char* msg
     config.url = url;
     config.crt_bundle_attach = esp_crt_bundle_attach; 
     config.buffer_size_tx = 2048; 
-    config.buffer_size = 16384; 
+    config.buffer_size = 16384;
+    config.timeout_ms = 15000;
     config.user_data = f; 
     
     config.event_handler = [](esp_http_client_event_t *evt) -> esp_err_t {
